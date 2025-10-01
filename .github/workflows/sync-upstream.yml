@@ -1,0 +1,145 @@
+name: Nightly upstream sync (master + release-*; sanitized)
+
+on:
+  schedule:
+    - cron: "23 3 * * *"   # nightly; adjust as needed
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      UPSTREAM_URL: https://github.com/apache/hudi.git
+      BRANCH_REGEX: '^(master|release-[1-9].*)$'   # <-- sync master and all release-* branches
+      PRESERVE_BRANCH: master                      # <-- keep our workflow(s) on this branch only
+      KEEP_WORKFLOWS: 'sync-upstream.yml'          # comma-separated list if you add more later
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Start SSH agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.DEPLOY_KEY }}
+
+      - name: Trust github.com host key
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+      - name: Use SSH remote
+        run: |
+          git remote set-url origin git@github.com:sophos/apache-hudi.git
+
+      - name: Configure git identity
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream & fetch
+        run: |
+          git remote add upstream "${UPSTREAM_URL}" || true
+          git fetch upstream --prune --tags
+          git fetch origin --prune
+
+      - name: Sync matching upstream branches (strip workflows)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Prepare keep list and stash copies BEFORE switching branches
+          IFS=',' read -r -a KEEP <<< "${KEEP_WORKFLOWS}"
+          KEEP_DIR="$(mktemp -d)"
+          mkdir -p "$KEEP_DIR"
+          for f in "${KEEP[@]}"; do
+            if [[ -f ".github/workflows/$f" ]]; then
+              cp ".github/workflows/$f" "$KEEP_DIR/$f"
+            elif git show "origin/${PRESERVE_BRANCH}:.github/workflows/$f" >/dev/null 2>&1; then
+              git show "origin/${PRESERVE_BRANCH}:.github/workflows/$f" > "$KEEP_DIR/$f"
+            fi
+          done
+          trap 'rm -rf "$KEEP_DIR"' EXIT
+
+          # Collect upstream branches to sync (master + release-*)
+          mapfile -t MATCHED < <(
+            git for-each-ref --format='%(refname:strip=3)' refs/remotes/upstream/ \
+            | grep -v '^HEAD$' \
+            | grep -E "${BRANCH_REGEX}" \
+            | sort
+          )
+
+          echo "Branches to sync:"
+          printf '  %s\n' "${MATCHED[@]:-}"
+
+          sanitize_and_push () {
+            local BR="$1"
+
+            # Reset local branch to upstream/<BR>
+            git checkout -B "$BR" "upstream/$BR"
+
+            if [[ "$BR" == "${PRESERVE_BRANCH}" ]]; then
+              # Ensure our workflows dir exists
+              mkdir -p .github/workflows
+
+              # Restore the KEEP files captured before checkout
+              for f in "${KEEP[@]}"; do
+                if [[ -f "$KEEP_DIR/$f" ]]; then
+                  cp "$KEEP_DIR/$f" ".github/workflows/${f}"
+                fi
+              done
+
+              # Delete everything else under workflows except the KEEP list
+              if [[ -d .github/workflows ]]; then
+                find .github/workflows -type f $(printf "! -name %q " "${KEEP[@]}") -delete 2>/dev/null || true
+              fi
+            else
+              # For non-master synced branches, remove workflows entirely
+              rm -rf .github/workflows
+            fi
+
+            # Stage all changes for tree comparison
+            git add -A
+
+            # Ensure we have the current origin ref for this branch (if it exists)
+            git fetch -q origin "$BR:refs/remotes/origin/$BR" || true
+
+            # Compare sanitized index tree to origin's current tree; skip if identical
+            SANITIZED_TREE=$(git write-tree)
+            if git show-ref --verify --quiet "refs/remotes/origin/$BR"; then
+              ORIGIN_TREE=$(git rev-parse "refs/remotes/origin/$BR^{tree}")
+              if [[ "$SANITIZED_TREE" == "$ORIGIN_TREE" ]]; then
+                echo "No changes to push for '$BR' (sanitized tree matches origin). Skipping."
+                git reset --hard "refs/remotes/origin/$BR"
+                return 0
+              fi
+            fi
+
+            # Only commit if index differs from HEAD
+            if git diff --cached --quiet; then
+              echo "Sanitized index equals HEAD for '$BR'; nothing to commit."
+            else
+              git commit -m "Sanitize workflows on '$BR' (fork policy)"
+            fi
+
+            git push --force-with-lease=refs/heads/"$BR" origin "refs/heads/$BR:refs/heads/$BR"
+          }
+
+          for BR in "${MATCHED[@]}"; do
+            sanitize_and_push "$BR"
+          done
+
+      - name: Sync tags (optional)
+        run: |
+          set -euo pipefail
+          git fetch upstream --tags
+          git push --tags origin
