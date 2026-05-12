@@ -145,6 +145,15 @@ public class HudiTableHandle
      * <p>
      * Returns {@code Optional.empty()} if the input string is null/empty
      * or if parsing the schema fails.
+     * <p>
+     * Sophos patch (CSA-21894): name validation is disabled on the parser. Writer schemas
+     * produced upstream from Scala/Java code paths that use inner-class binary names (e.g.
+     * {@code Types$GeoSummary}, {@code File$FileInfo}) embed {@code $} in Avro namespace
+     * parts. Avro's default {@code NameValidator} rejects {@code $} per the spec rule
+     * {@code [A-Za-z_][A-Za-z0-9_]*}, which fails query planning even though the schema
+     * round-trips through the writer/reader fine for Parquet-backed Hudi tables. Disabling
+     * name validation here keeps these tables queryable; default-value validation is left
+     * on.
      */
     private static Optional<Lazy<Schema>> buildTableSchema(String tableSchemaStr)
     {
@@ -153,7 +162,7 @@ public class HudiTableHandle
         }
 
         try {
-            Lazy<Schema> lazySchema = Lazy.lazily(() -> new Schema.Parser().parse(tableSchemaStr));
+            Lazy<Schema> lazySchema = Lazy.lazily(() -> new Schema.Parser().setValidate(false).parse(tableSchemaStr));
             return Optional.of(lazySchema);
         }
         catch (Exception e) {
