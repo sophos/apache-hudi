@@ -24,6 +24,7 @@ import io.trino.spi.TrinoException;
 import io.trino.spi.connector.ConnectorTableHandle;
 import io.trino.spi.connector.SchemaTableName;
 import io.trino.spi.predicate.TupleDomain;
+import org.apache.avro.NameValidator;
 import org.apache.avro.Schema;
 import org.apache.hudi.common.model.HoodieTableType;
 import org.apache.hudi.common.table.HoodieTableMetaClient;
@@ -154,6 +155,9 @@ public class HudiTableHandle
      * round-trips through the writer/reader fine for Parquet-backed Hudi tables. Disabling
      * name validation here keeps these tables queryable; default-value validation is left
      * on.
+     * <p>
+     * Uses the Avro 1.12 {@code Parser(NameValidator)} constructor — Trino 472's SDK pulls
+     * Avro 1.12.0 transitively, which dropped the older {@code setValidate(boolean)} setter.
      */
     private static Optional<Lazy<Schema>> buildTableSchema(String tableSchemaStr)
     {
@@ -162,7 +166,7 @@ public class HudiTableHandle
         }
 
         try {
-            Lazy<Schema> lazySchema = Lazy.lazily(() -> new Schema.Parser().setValidate(false).parse(tableSchemaStr));
+            Lazy<Schema> lazySchema = Lazy.lazily(() -> new Schema.Parser(NameValidator.NO_VALIDATION).parse(tableSchemaStr));
             return Optional.of(lazySchema);
         }
         catch (Exception e) {
