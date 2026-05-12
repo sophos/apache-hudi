@@ -56,6 +56,8 @@ import org.slf4j.LoggerFactory;
 import javax.annotation.concurrent.ThreadSafe;
 
 import java.io.IOException;
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
@@ -76,6 +78,76 @@ import static org.apache.hudi.avro.AvroSchemaUtils.createNullableSchema;
 public class TableSchemaResolver {
 
   private static final Logger LOG = LoggerFactory.getLogger(TableSchemaResolver.class);
+
+  /**
+   * Sophos patch (CSA-21894): cached reflective handles for disabling Avro name validation.
+   * Writer schemas produced upstream from Scala/Java code paths that use inner-class binary
+   * names (e.g. {@code Types$GeoSummary}, {@code File$FileInfo}) embed {@code $} in Avro
+   * namespace parts. Avro's default {@code NameValidator} rejects {@code $} per the spec
+   * rule {@code [A-Za-z_][A-Za-z0-9_]*}, which fails query planning even though the schemas
+   * round-trip through writer/reader fine for Parquet-backed Hudi tables.
+   * <p>
+   * The disable-validation API differs across Avro versions: 1.11.x exposes the instance
+   * setter {@code Parser#setValidate(boolean)} (removed in 1.12); 1.12.x exposes the
+   * constructor {@code Parser(NameValidator)} with the sentinel {@code NameValidator.NO_VALIDATION}
+   * (does not exist in 1.11). {@code hudi-common} compiles against the parent pom's default
+   * Avro (1.11.x) but ships shaded inside the Trino plugin where Avro 1.12.0 wins on the
+   * runtime classpath, so we cannot bind to either API at compile time. We resolve the
+   * available API once at class-load and reuse the handles per parse.
+   */
+  private static final Method AVRO_1_11_SET_VALIDATE;
+  private static final Constructor<Schema.Parser> AVRO_1_12_PARSER_CTOR;
+  private static final Object AVRO_1_12_NO_VALIDATION;
+
+  static {
+    Method setValidate = null;
+    Constructor<Schema.Parser> ctor = null;
+    Object noValidation = null;
+    try {
+      setValidate = Schema.Parser.class.getMethod("setValidate", boolean.class);
+    } catch (NoSuchMethodException nsme) {
+      try {
+        Class<?> nv = Class.forName("org.apache.avro.NameValidator");
+        noValidation = nv.getField("NO_VALIDATION").get(null);
+        @SuppressWarnings("unchecked")
+        Constructor<Schema.Parser> c = (Constructor<Schema.Parser>) Schema.Parser.class.getConstructor(nv);
+        ctor = c;
+      } catch (ReflectiveOperationException roe) {
+        LOG.warn("Avro on the classpath exposes neither Parser.setValidate(boolean) (1.11.x) "
+            + "nor Parser(NameValidator) (1.12.x); writer schemas containing '$' in namespace "
+            + "parts will fail to parse.", roe);
+      }
+    }
+    AVRO_1_11_SET_VALIDATE = setValidate;
+    AVRO_1_12_PARSER_CTOR = ctor;
+    AVRO_1_12_NO_VALIDATION = noValidation;
+  }
+
+  /**
+   * Sophos patch (CSA-21894): parse an Avro schema with name validation disabled. See the
+   * comment on {@link #AVRO_1_11_SET_VALIDATE} for the rationale and the cross-version
+   * resolution strategy.
+   */
+  private static Schema parseSchemaWithoutNameValidation(String schemaStr) {
+    Schema.Parser parser;
+    if (AVRO_1_12_PARSER_CTOR != null) {
+      try {
+        parser = AVRO_1_12_PARSER_CTOR.newInstance(AVRO_1_12_NO_VALIDATION);
+      } catch (ReflectiveOperationException roe) {
+        parser = new Schema.Parser();
+      }
+    } else {
+      parser = new Schema.Parser();
+      if (AVRO_1_11_SET_VALIDATE != null) {
+        try {
+          AVRO_1_11_SET_VALIDATE.invoke(parser, false);
+        } catch (ReflectiveOperationException roe) {
+          // fall through; parser keeps its default (validating) behavior
+        }
+      }
+    }
+    return parser.parse(schemaStr);
+  }
 
   protected final HoodieTableMetaClient metaClient;
 
@@ -212,7 +284,7 @@ public class TableSchemaResolver {
     if (instantAndCommitMetadata.isPresent()) {
       HoodieCommitMetadata commitMetadata = instantAndCommitMetadata.get().getRight();
       String schemaStr = commitMetadata.getMetadata(HoodieCommitMetadata.SCHEMA_KEY);
-      Schema schema = new Schema.Parser().parse(schemaStr);
+      Schema schema = parseSchemaWithoutNameValidation(schemaStr);
       if (includeMetadataFields) {
         schema = HoodieAvroUtils.addMetadataFields(schema, hasOperationField.get());
       } else {
@@ -233,7 +305,7 @@ public class TableSchemaResolver {
         return Option.empty();
       }
 
-      Schema schema = new Schema.Parser().parse(existingSchemaStr);
+      Schema schema = parseSchemaWithoutNameValidation(existingSchemaStr);
       if (includeMetadataFields) {
         schema = HoodieAvroUtils.addMetadataFields(schema, hasOperationField.get());
       } else {
