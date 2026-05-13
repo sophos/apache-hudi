@@ -38,14 +38,18 @@ import io.trino.spi.predicate.TupleDomain;
 import io.trino.spi.type.VarcharType;
 import org.apache.avro.Schema;
 import org.apache.avro.SchemaBuilder;
+import org.apache.hudi.avro.HoodieAvroUtils;
 import org.apache.hudi.common.fs.FSUtils;
 import org.apache.hudi.common.model.FileSlice;
 import org.apache.hudi.common.model.HoodieBaseFile;
+import org.apache.hudi.common.model.HoodieCommitMetadata;
 import org.apache.hudi.common.model.HoodieFileFormat;
 import org.apache.hudi.common.model.HoodieFileGroupId;
 import org.apache.hudi.common.model.HoodieLogFile;
 import org.apache.hudi.common.table.HoodieTableMetaClient;
 import org.apache.hudi.common.table.TableSchemaResolver;
+import org.apache.hudi.common.table.timeline.HoodieInstant;
+import org.apache.hudi.common.table.timeline.HoodieTimeline;
 import org.apache.hudi.common.table.view.HoodieTableFileSystemView;
 import org.apache.hudi.common.util.HoodieTimer;
 import org.apache.hudi.exception.TableNotFoundException;
@@ -54,8 +58,11 @@ import org.apache.hudi.storage.StoragePath;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -83,6 +90,88 @@ import static org.apache.hudi.common.model.HoodieRecord.HOODIE_META_COLUMNS;
 public final class HudiUtil
 {
     private static final Logger log = Logger.get(HudiUtil.class);
+
+    /**
+     * Sophos patch (CSA-21894): cached reflective handles for disabling Avro name validation.
+     * Writer schemas produced upstream from Scala/Java code paths that use inner-class binary
+     * names (e.g. {@code Types$GeoSummary}, {@code File$FileInfo}) embed {@code $} in Avro
+     * namespace parts. Avro's default {@code NameValidator} rejects {@code $} per the spec
+     * rule {@code [A-Za-z_][A-Za-z0-9_]*}, which fails query planning even though the schemas
+     * round-trip through writer/reader fine for Parquet-backed Hudi tables.
+     * <p>
+     * The disable-validation API differs across Avro versions: 1.11.x exposes the instance
+     * setter {@code Parser#setValidate(boolean)} (removed in 1.12); 1.12.x exposes the
+     * constructor {@code Parser(NameValidator)} with sentinel {@code NameValidator.NO_VALIDATION}
+     * (does not exist in 1.11). We resolve whichever API is available at class-load and reuse
+     * the handles per parse, so the same source compiles and runs against either Avro line.
+     * <p>
+     * Sibling helpers live in {@link HudiTableHandle#buildTableSchema(String)} (worker-side
+     * deserialization path) and in the fork's {@code hudi-common} {@code TableSchemaResolver}
+     * (coordinator commit-metadata fetch path when {@code hudi-common} is rebuilt from the
+     * fork). This copy in {@link HudiUtil} is the one that actually wins in deployment today,
+     * because {@code data-presto-lib}'s {@code hudi-trino-plugin} build pulls
+     * {@code org.apache.hudi:hudi-common:1.0.2} from Maven Central rather than the fork
+     * sources — so a patch in {@code TableSchemaResolver} alone is invisible at runtime.
+     */
+    private static final Method AVRO_1_11_SET_VALIDATE;
+    private static final Constructor<Schema.Parser> AVRO_1_12_PARSER_CTOR;
+    private static final Object AVRO_1_12_NO_VALIDATION;
+
+    static {
+        Method setValidate = null;
+        Constructor<Schema.Parser> ctor = null;
+        Object noValidation = null;
+        try {
+            setValidate = Schema.Parser.class.getMethod("setValidate", boolean.class);
+        }
+        catch (NoSuchMethodException nsme) {
+            try {
+                Class<?> nv = Class.forName("org.apache.avro.NameValidator");
+                noValidation = nv.getField("NO_VALIDATION").get(null);
+                @SuppressWarnings("unchecked")
+                Constructor<Schema.Parser> c = (Constructor<Schema.Parser>) Schema.Parser.class.getConstructor(nv);
+                ctor = c;
+            }
+            catch (ReflectiveOperationException roe) {
+                log.warn(roe, "Avro on the classpath exposes neither Parser.setValidate(boolean) (1.11.x) "
+                        + "nor Parser(NameValidator) (1.12.x); writer schemas containing '$' in namespace "
+                        + "parts will fail to parse.");
+            }
+        }
+        AVRO_1_11_SET_VALIDATE = setValidate;
+        AVRO_1_12_PARSER_CTOR = ctor;
+        AVRO_1_12_NO_VALIDATION = noValidation;
+    }
+
+    /**
+     * Sophos patch (CSA-21894): parse an Avro schema with name validation disabled.
+     * See {@link #AVRO_1_11_SET_VALIDATE} for rationale and the cross-version resolution.
+     */
+    private static Schema parseSchemaWithoutNameValidation(String schemaStr)
+    {
+        Schema.Parser parser;
+        if (AVRO_1_12_PARSER_CTOR != null) {
+            try {
+                parser = AVRO_1_12_PARSER_CTOR.newInstance(AVRO_1_12_NO_VALIDATION);
+            }
+            catch (ReflectiveOperationException roe) {
+                parser = new Schema.Parser();
+            }
+        }
+        else {
+            parser = new Schema.Parser();
+            if (AVRO_1_11_SET_VALIDATE != null) {
+                try {
+                    AVRO_1_11_SET_VALIDATE.invoke(parser, false);
+                }
+                catch (ReflectiveOperationException roe) {
+                    // parser keeps its default (validating) behavior
+                }
+            }
+        }
+        return parser.parse(schemaStr);
+    }
+
     private static final Cache<Schema, Map<String, Schema.Field>> SCHEMA_FIELD_CACHE =
             EvictableCacheBuilder.newBuilder()
                     .maximumWeight(10L * 1000L * 1024L) // 10MB
@@ -388,13 +477,83 @@ public final class HudiUtil
     {
         try {
             HoodieTimer timer = HoodieTimer.start();
-            Schema schema = new TableSchemaResolver(metaClient).getTableAvroSchema();
+            Schema schema = readLatestSchemaPermissive(metaClient)
+                    .orElseGet(() -> resolveSchemaViaTableSchemaResolver(metaClient));
             log.info("Fetched table schema for table %s in %s ms", tableName, timer.endTimer());
             return schema;
         }
         catch (Exception e) {
             // failed to read schema
             throw new TrinoException(HUDI_FILESYSTEM_ERROR, e);
+        }
+    }
+
+    /**
+     * Sophos patch (CSA-21894): fetch the latest writer schema from commit metadata using
+     * only public timeline APIs and parse it through {@link #parseSchemaWithoutNameValidation}.
+     * <p>
+     * This bypasses {@code new TableSchemaResolver(metaClient).getTableAvroSchema()} on its
+     * happy path. {@code TableSchemaResolver} lives in {@code hudi-common}, which our build
+     * pulls from Maven Central at {@code 1.0.2} rather than from the Sophos fork — so the
+     * patched parser inside the fork's {@code TableSchemaResolver.getTableSchemaFromLatestCommitMetadata}
+     * never actually executes in deployment. By doing the timeline read + permissive parse
+     * here, in {@code hudi-trino-plugin} (which IS built from fork sources), the fix lands
+     * regardless of which {@code hudi-common} jar ends up on the classpath.
+     * <p>
+     * Returns {@link Optional#empty()} when no completed commit carries a schema (fresh
+     * tables, table-create-only configs, log-only datasets). Callers fall back to the
+     * full {@link TableSchemaResolver} chain in those cases — that path doesn't trigger
+     * the {@code $}-in-namespace failure because it doesn't parse a commit-metadata schema.
+     */
+    private static Optional<Schema> readLatestSchemaPermissive(HoodieTableMetaClient metaClient)
+    {
+        HoodieTimeline timeline = metaClient.getActiveTimeline().getCommitsTimeline().filterCompletedInstants();
+        boolean populateMetaFields = metaClient.getTableConfig().populateMetaFields();
+        Iterator<HoodieInstant> reverseInstants = timeline.getReverseOrderedInstants().iterator();
+        while (reverseInstants.hasNext()) {
+            HoodieInstant instant = reverseInstants.next();
+            String schemaStr;
+            try {
+                HoodieCommitMetadata commitMetadata = timeline.readCommitMetadata(instant);
+                schemaStr = commitMetadata.getMetadata(HoodieCommitMetadata.SCHEMA_KEY);
+            }
+            catch (IOException ioe) {
+                // Treat unreadable commit metadata as "no schema here" and walk back to older
+                // instants; matches TableSchemaResolver.getLatestCommitMetadataWithValidSchema's
+                // filter-then-continue behavior.
+                log.warn(ioe, "Failed to read commit metadata for instant %s on table %s; trying older instants",
+                        instant, metaClient.getBasePath());
+                continue;
+            }
+            if (schemaStr == null || schemaStr.isEmpty()) {
+                continue;
+            }
+            Schema schema = parseSchemaWithoutNameValidation(schemaStr);
+            if (populateMetaFields) {
+                // hasOperationField is rarely true for analytics tables and is only inspectable
+                // via TableSchemaResolver (which itself triggers a Parquet footer read). The
+                // false default matches non-CDC writes; CDC-style operation tracking would
+                // need its own path here.
+                schema = HoodieAvroUtils.addMetadataFields(schema, false);
+            }
+            return Optional.of(schema);
+        }
+        return Optional.empty();
+    }
+
+    /**
+     * Sophos patch (CSA-21894): edge-case fallback to {@link TableSchemaResolver}. Called only
+     * when commit metadata yields no schema (fresh table, table-create-only config, log-only
+     * dataset). In those cases the strict-parse code path inside vanilla {@code hudi-common}
+     * is not reached because there is no commit-metadata schema string to feed into it.
+     */
+    private static Schema resolveSchemaViaTableSchemaResolver(HoodieTableMetaClient metaClient)
+    {
+        try {
+            return new TableSchemaResolver(metaClient).getTableAvroSchema();
+        }
+        catch (Exception e) {
+            throw new RuntimeException(e);
         }
     }
 }
